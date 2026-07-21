@@ -6,6 +6,7 @@ import re
 import requests
 from flask import Flask, jsonify, render_template_string
 from pymongo import MongoClient
+from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
@@ -53,10 +54,10 @@ def ensure_background_engine_running():
         background_engine_thread = threading.Thread(target=run_background_state_scheduler, daemon=True)
         background_engine_thread.start()
 
+from zoneinfo import ZoneInfo
+
 def get_ny_time():
-    utc_now = datetime.datetime.now(datetime.timezone.utc)
-    ny_offset = datetime.timedelta(hours=-4) 
-    return utc_now + ny_offset
+    return datetime.datetime.now(ZoneInfo("America/New_York"))
 
 def load_db_document(collection, doc_id="state_doc"):
     try:
