@@ -4,7 +4,6 @@ import time
 import threading
 import re
 import requests
-import concurrent.futures
 from flask import Flask, jsonify, render_template_string
 from pymongo import MongoClient
 
@@ -15,9 +14,7 @@ MONGO_URI = os.environ.get('MONGO_URI')
 IG_API_KEY = os.environ.get('IG_API_KEY')
 IG_USERNAME = os.environ.get('IG_USERNAME')
 IG_PASSWORD = os.environ.get('IG_PASSWORD')
-IG_ACCOUNT_TYPE = os.environ.get('IG_ACCOUNT_TYPE', 'demo').lower()  # 'demo' or 'live'
-
-IG_BASE_URL = "https://demo-api.ig.com/gateway/deal" if IG_ACCOUNT_TYPE == "demo" else "https://api.ig.com/gateway/deal"
+IG_API_URL = os.environ.get('IG_API_URL', 'https://api.ig.com/gateway/deal') # Use https://demo-api.ig.com/gateway/deal for demo
 
 # --- MONGO DATABASE CONFIGURATION ---
 client = MongoClient(MONGO_URI if MONGO_URI else "mongodb://localhost:27017/")
@@ -27,97 +24,28 @@ baseline_collection = db["session_baselines"]
 daily_baseline_collection = db["daily_baselines"]
 cache_collection = db["api_cache"]
 
-# IG "market IDs" for FX majors + gold. Gold confirmed via the API
-# Companion as "GC" (not "GOLD", which returns a valid 200 but always
-# 0.0/0.0 -- that marketId exists but carries no sentiment coverage).
+# --- IG MARKET ID MAPPING ---
 IG_SYMBOL_MAP = {
-    "EURUSD": "EURUSD", "GBPUSD": "GBPUSD", "AUDUSD": "AUDUSD",
-    "NZDUSD": "NZDUSD", "USDCHF": "USDCHF", "USDCAD": "USDCAD",
-    "USDJPY": "USDJPY", "XAUUSD": "GC"
+    "EURUSD": "EURUSD",
+    "GBPUSD": "GBPUSD",
+    "AUDUSD": "AUDUSD",
+    "NZDUSD": "NZDUSD",
+    "USDCHF": "USDCHF",
+    "USDCAD": "USDCAD",
+    "USDJPY": "USDJPY",
+    "XAUUSD": "GC"  # IG uses 'GC' for Gold sentiment
 }
+
+# Global session token cache for IG API
+IG_SESSION_TOKENS = {"cst": None, "x_security_token": None}
 
 # --- HELPER: SCHEMA-AGNOSTIC DATA RETRIEVAL ---
 def get_safe_volume(data_dict, primary_key, secondary_key, fallback_value):
-    """Retrieves volume data regardless of key naming schema."""
+    """Retrieves volume data regardless of key naming schema (long/longVolume)."""
     val = data_dict.get(primary_key)
     if val is None:
         val = data_dict.get(secondary_key)
     return float(val) if val is not None else float(fallback_value)
-
-# --- IG SESSION STATE ---
-# IG session tokens (CST / X-SECURITY-TOKEN) are valid for ~6 hours and get
-# extended automatically while in use, so we authenticate once and reuse the
-# cached tokens across scheduler ticks rather than logging in every poll --
-# repeated logins are wasteful and a good way to get an API key throttled.
-_ig_session = {"cst": None, "xst": None, "authenticated_at": None}
-_ig_session_lock = threading.Lock()
-
-def ig_authenticate():
-    """Logs into the IG REST API (v2 session) and caches the session tokens."""
-    try:
-        resp = requests.post(
-            f"{IG_BASE_URL}/session",
-            headers={
-                "X-IG-API-KEY": IG_API_KEY,
-                "Version": "2",
-                "Content-Type": "application/json; charset=UTF-8",
-                "Accept": "application/json; charset=UTF-8"
-            },
-            json={"identifier": IG_USERNAME, "password": IG_PASSWORD},
-            timeout=10
-        )
-        if resp.status_code == 200:
-            with _ig_session_lock:
-                _ig_session["cst"] = resp.headers.get("CST")
-                _ig_session["xst"] = resp.headers.get("X-SECURITY-TOKEN")
-                _ig_session["authenticated_at"] = datetime.datetime.now(datetime.timezone.utc)
-            return True
-        print(f"IG Auth Error: {resp.status_code} {resp.text[:200]}")
-        return False
-    except Exception as e:
-        print(f"IG Auth Exception: {str(e)}")
-        return False
-
-def ensure_ig_session():
-    """Re-authenticates only if there's no cached session or it's getting old."""
-    with _ig_session_lock:
-        stale = (
-            not _ig_session["cst"] or
-            not _ig_session["authenticated_at"] or
-            (datetime.datetime.now(datetime.timezone.utc) - _ig_session["authenticated_at"]).total_seconds() > 5 * 3600
-        )
-    if stale:
-        return ig_authenticate()
-    return True
-
-def fetch_ig(pair_name, market_id, retry=True):
-    if not ensure_ig_session():
-        return pair_name, None
-    try:
-        with _ig_session_lock:
-            headers = {
-                "X-IG-API-KEY": IG_API_KEY,
-                "CST": _ig_session["cst"],
-                "X-SECURITY-TOKEN": _ig_session["xst"],
-                "Version": "1",
-                "Accept": "application/json; charset=UTF-8"
-            }
-        res = requests.get(f"{IG_BASE_URL}/clientsentiment/{market_id}", headers=headers, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            return pair_name, {
-                "long": float(data.get("longPositionPercentage", 0)),
-                "short": float(data.get("shortPositionPercentage", 0))
-            }
-        if res.status_code == 401 and retry:
-            # Token likely expired early -- force one re-auth and retry once.
-            if ig_authenticate():
-                return fetch_ig(pair_name, market_id, retry=False)
-        print(f"IG Fetch Error for {pair_name}: {res.status_code} {res.text[:200]}")
-        return pair_name, None
-    except Exception as e:
-        print(f"IG Fetch Exception for {pair_name}: {str(e)}")
-        return pair_name, None
 
 # --- THREADING ENGINE ---
 background_engine_thread = None
@@ -131,7 +59,7 @@ def ensure_background_engine_running():
 
 def get_ny_time():
     utc_now = datetime.datetime.now(datetime.timezone.utc)
-    ny_offset = datetime.timedelta(hours=-4)
+    ny_offset = datetime.timedelta(hours=-4) 
     return utc_now + ny_offset
 
 def load_db_document(collection, doc_id="state_doc"):
@@ -157,6 +85,83 @@ def get_current_session_details(ny_dt):
 def clean_symbol_key(key_str):
     return re.sub(r'[^a-zA-Z]', '', str(key_str)).lower()
 
+# --- IG REST API CLIENT ---
+def authenticate_ig_session():
+    """Authenticates with IG API and captures CST and X-SECURITY-TOKEN headers."""
+    try:
+        url = f"{IG_API_URL}/session"
+        headers = {
+            "X-IG-API-KEY": IG_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json; charset=UTF-8",
+            "VERSION": "2"
+        }
+        payload = {"identifier": IG_USERNAME, "password": IG_PASSWORD}
+        res = requests.post(url, json=payload, headers=headers, timeout=10)
+        
+        if res.status_code == 200:
+            cst = res.headers.get("CST")
+            x_sec = res.headers.get("X-SECURITY-TOKEN")
+            IG_SESSION_TOKENS["cst"] = cst
+            IG_SESSION_TOKENS["x_security_token"] = x_sec
+            return cst, x_sec
+        else:
+            print(f"IG Auth Failed: Status {res.status_code} - {res.text}")
+            return None, None
+    except Exception as e:
+        print(f"IG Auth Exception: {str(e)}")
+        return None, None
+
+def fetch_ig_client_sentiment():
+    """Fetches real-time retail client sentiment percentages from IG."""
+    cst = IG_SESSION_TOKENS.get("cst")
+    x_sec = IG_SESSION_TOKENS.get("x_security_token")
+    
+    if not cst or not x_sec:
+        cst, x_sec = authenticate_ig_session()
+        if not cst: return None
+
+    market_ids = ",".join(IG_SYMBOL_MAP.values())
+    url = f"{IG_API_URL}/clientsentiment?marketIds={market_ids}"
+    headers = {
+        "X-IG-API-KEY": IG_API_KEY,
+        "CST": cst,
+        "X-SECURITY-TOKEN": x_sec,
+        "Accept": "application/json; charset=UTF-8",
+        "VERSION": "1"
+    }
+    
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        
+        # If session expired (401), re-authenticate once
+        if res.status_code == 401:
+            cst, x_sec = authenticate_ig_session()
+            if not cst: return None
+            headers["CST"] = cst
+            headers["X-SECURITY-TOKEN"] = x_sec
+            res = requests.get(url, headers=headers, timeout=10)
+
+        if res.status_code == 200:
+            data = res.json().get("clientSentiments", [])
+            reverse_map = {v: k for k, v in IG_SYMBOL_MAP.items()}
+            results = {}
+            for item in data:
+                m_id = item.get("marketId")
+                sym = reverse_map.get(m_id)
+                if sym:
+                    results[sym] = {
+                        "long": float(item.get("longPositionPercentage", 50.0)),
+                        "short": float(item.get("shortPositionPercentage", 50.0))
+                    }
+            return results
+        else:
+            print(f"IG Sentiment Fetch Error: {res.status_code} - {res.text}")
+            return None
+    except Exception as e:
+        print(f"IG Fetch Exception: {str(e)}")
+        return None
+
 # --- BACKGROUND AUTOMATION ENGINE ---
 def run_background_state_scheduler():
     while True:
@@ -164,84 +169,45 @@ def run_background_state_scheduler():
             ny_now = get_ny_time()
             current_date_str = ny_now.strftime("%Y-%m-%d")
             current_session_label, session_anchor_hour = get_current_session_details(ny_now)
-
-            # Fetch Data. Kept to a modest worker count since IG's non-trading
-            # endpoints are rate-limited per API key/account; 8 pairs at once
-            # is well within normal limits, but avoid pushing this much higher.
-            symbols = {}
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as exe:
-                futures = {exe.submit(fetch_ig, p, m): p for p, m in IG_SYMBOL_MAP.items()}
-                for f in concurrent.futures.as_completed(futures):
-                    p, res = f.result()
-                    if res: symbols[p] = res
-
+            
+            # 1. Fetch Fresh IG Sentiment Data
+            symbols = fetch_ig_client_sentiment()
+            
             if symbols:
-                cache_collection.replace_one({"_id": "state_doc"}, {
-                    "_id": "state_doc",
+                save_db_document(cache_collection, {
                     "last_fetch_time": ny_now.strftime("%Y-%m-%d %H:%M:%S"),
                     "live_pairs": symbols
-                }, upsert=True)
+                }, "state_doc")
 
-            # --- SESSION BASELINE DUAL-TRACKING CALIBRATION ---
+            # 2. Session Anchor Logic (Session Open Reset)
             stored_baseline = load_db_document(baseline_collection)
+            if symbols and stored_baseline.get("active_session") != current_session_label:
+                save_db_document(baseline_collection, {
+                    "baseline_date": current_date_str,
+                    "active_session": current_session_label,
+                    "anchor_hour": session_anchor_hour,
+                    "volumes": symbols
+                }, "state_doc")
 
-            session_did_change = (
-                not stored_baseline or
-                (stored_baseline.get("active_session") != current_session_label and
-                 stored_baseline.get("pending_session") != current_session_label)
-            )
-
-            if session_did_change and symbols:
-                updated_baseline = dict(stored_baseline) if stored_baseline else {}
-                updated_baseline.update({
-                    "pending_session": current_session_label,
-                    "pending_date": current_date_str,
-                    "pending_anchor_hour": session_anchor_hour,
-                    "pending_volumes": symbols,
-                    "transition_counter": 1
-                })
-                save_db_document(baseline_collection, updated_baseline)
-                stored_baseline = updated_baseline
-                print(f"Handoff Log: Staging baseline sequence initiated for {current_session_label}. Reading 1/3 secured.")
-
-            elif stored_baseline.get("pending_session") and symbols:
-                current_count = stored_baseline.get("transition_counter", 0) + 1
-                print(f"Handoff Log: Incremented update block {current_count}/3 for {stored_baseline.get('pending_session')}")
-
-                if current_count >= 3:
-                    stored_baseline = {
-                        "baseline_date": stored_baseline.get("pending_date"),
-                        "active_session": stored_baseline.get("pending_session"),
-                        "anchor_hour": stored_baseline.get("pending_anchor_hour"),
-                        "volumes": stored_baseline.get("pending_volumes")
-                    }
-                    save_db_document(baseline_collection, stored_baseline)
-                    print(f"Handoff Complete: Safely hot-swapped session view over to: {stored_baseline.get('active_session')}")
-                else:
-                    baseline_collection.update_one(
-                        {"_id": "state_doc"},
-                        {"$set": {"transition_counter": current_count}}
-                    )
-
-            # Daily Anchor Logic
+            # 3. Daily Anchor Logic (5 PM NY Reset)
             stored_daily_baseline = load_db_document(daily_baseline_collection, "daily_state_doc")
             current_daily_anchor_date = ny_now.strftime("%Y-%m-%d") if ny_now.hour >= 17 else (ny_now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-
-            if not stored_daily_baseline or stored_daily_baseline.get("daily_anchor_date") != current_daily_anchor_date:
-                if symbols:
-                    save_db_document(daily_baseline_collection, {
-                        "daily_anchor_date": current_daily_anchor_date,
-                        "volumes": symbols,
-                        "captured_at": ny_now.strftime("%Y-%m-%d %H:%M:%S")
-                    }, "daily_state_doc")
+            
+            if symbols and (not stored_daily_baseline or stored_daily_baseline.get("daily_anchor_date") != current_daily_anchor_date):
+                save_db_document(daily_baseline_collection, {
+                    "daily_anchor_date": current_daily_anchor_date, 
+                    "volumes": symbols, 
+                    "captured_at": ny_now.strftime("%Y-%m-%d %H:%M:%S")
+                }, "daily_state_doc")
 
         except Exception as e:
-            print(f"Loop Error: {str(e)}")
+            print(f"Scheduler Loop Error: {str(e)}")
         time.sleep(60)
 
+# --- SENTIMENT MATRIX ENGINE ---
 def process_sentiment_matrix():
-    SCALE_FACTOR = 1000
-
+    SCALE_FACTOR = 1000 
+    
     ny_now = get_ny_time()
     cached_data = load_db_document(cache_collection)
     live_pairs = {str(k): v for k, v in cached_data.get("live_pairs", {}).items()}
@@ -252,51 +218,57 @@ def process_sentiment_matrix():
 
     majors = ["EUR", "GBP", "USD", "AUD", "NZD", "CAD", "CHF", "JPY"]
     tracked_assets = majors + ["GOLD"]
-
+    
     abs_long_pct_sum = {asset: 0.0 for asset in tracked_assets}
     abs_pair_counts = {asset: 0 for asset in tracked_assets}
     sess_long_delta, sess_short_delta = {a: 0.0 for a in tracked_assets}, {a: 0.0 for a in tracked_assets}
     daily_long_delta, daily_short_delta = {a: 0.0 for a in tracked_assets}, {a: 0.0 for a in tracked_assets}
-
+    
     for name, live in live_pairs.items():
         cleaned_name = clean_symbol_key(name)
         l_long, l_short = float(live.get("long", 0)), float(live.get("short", 0))
         total_live = l_long + l_short
-
+        
+        # Retrieve baseline documents safely
         b_val = baseline_volumes.get(name, {})
         d_val = daily_baseline_volumes.get(name, {})
-
+        
+        # Schema-Agnostic extraction via helper
         b_long = get_safe_volume(b_val, "long", "longVolume", l_long)
         b_short = get_safe_volume(b_val, "short", "shortVolume", l_short)
-        d_long = get_safe_volume(d_val, "long", "longVolume", l_long)
-        d_short = get_safe_volume(d_val, "short", "shortVolume", l_short)
-
-        if cleaned_name == "gold":
-            if total_live > 0:
-                abs_long_pct_sum["GOLD"] = (l_long / total_live)
-                abs_pair_counts["GOLD"] = 1
+        
+        d_long = get_safe_volume(d_val, "longVolume", "long", l_long)
+        d_short = get_safe_volume(d_val, "shortVolume", "short", l_short)
+        
+        # Calculate Delta Logic
+        if cleaned_name == "xauusd":
+            if total_live > 0: abs_long_pct_sum["GOLD"] = (l_long / total_live)
+            abs_pair_counts["GOLD"] = 1
             sess_long_delta["GOLD"] = (l_long - b_long)
             sess_short_delta["GOLD"] = (l_short - b_short)
             daily_long_delta["GOLD"] = (l_long - d_long)
             daily_short_delta["GOLD"] = (l_short - d_short)
             continue
-
+            
         if len(cleaned_name) != 6: continue
         base, quote = cleaned_name[0:3].upper(), cleaned_name[3:6].upper()
-
+        
         if base in majors and quote in majors:
             if total_live > 0:
                 abs_long_pct_sum[base] += (l_long / total_live); abs_pair_counts[base] += 1
                 abs_long_pct_sum[quote] += (l_short / total_live); abs_pair_counts[quote] += 1
-
+            
+            # Session Delta
             sess_long_delta[base] += (l_long - b_long); sess_short_delta[base] += (l_short - b_short)
             sess_long_delta[quote] += (l_short - b_short); sess_short_delta[quote] += (l_long - b_long)
 
+            # Daily Delta
             daily_long_delta[base] += (l_long - d_long); daily_short_delta[base] += (l_short - d_short)
             daily_long_delta[quote] += (l_short - d_short); daily_short_delta[quote] += (l_long - d_long)
 
+    # --- FORMATTING OUTPUT ---
     currency_scores, daily_currency_scores, bias_output = {}, {}, []
-
+    
     for cur in tracked_assets:
         count = abs_pair_counts[cur]
         inv_long_ratio = (abs_long_pct_sum[cur] / count) if count > 0 else 0.5
@@ -312,7 +284,7 @@ def process_sentiment_matrix():
         d_formatted_score = int(round(d_net_shift, 0))
         d_status_str = "UP" if d_formatted_score > 0 else ("DOWN" if d_formatted_score < 0 else ("UP" if inv_long_ratio >= 0.5 else "DOWN"))
         daily_currency_scores[cur] = {"currency": display_name, "value": abs(d_formatted_score), "status": d_status_str}
-
+    
     return {
         "top_4_up": [x for x in sorted(list(currency_scores.values()), key=lambda x: x['value'], reverse=True) if x['status'] == "UP"],
         "bottom_4_down": [x for x in sorted(list(currency_scores.values()), key=lambda x: x['value'], reverse=False) if x['status'] == "DOWN"],
@@ -330,16 +302,16 @@ DASHBOARD_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IG Sentiment Matrix Terminal</title>
+    <title>IG Client Sentiment Matrix Terminal</title>
     <style>
         body { background-color: #0b0e14; color: #e2e8f0; font-family: -apple-system, sans-serif; margin: 0; padding: 25px; }
         .container { max-width: 1300px; margin: 0 auto; }
         .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1e293b; padding-bottom: 15px; margin-bottom: 25px; }
-        h1 { margin: 0; font-size: 22px; color: #38bdf8; font-weight: 700; }
+        h1 { margin: 0; font-size: 22px; color: #e11d48; font-weight: 700; }
         h2 { font-size: 13px; color: #94a3b8; margin-bottom: 15px; text-transform: uppercase; }
         .session-tracker-bar { display: flex; gap: 10px; margin-bottom: 25px; }
         .session-card { flex: 1; padding: 12px; border-radius: 8px; text-align: center; font-size: 12px; font-weight: 700; background-color: #111827; border: 1px solid #1f2937; color: #475569; }
-        .active-session-live { background-color: #1e1b4b; border: 2px solid #6366f1; color: #818cf8; }
+        .active-session-live { background-color: #881337; border: 2px solid #f43f5e; color: #fda4af; }
         .section-split { display: flex; flex-direction: row; gap: 25px; width: 100%; align-items: flex-start; }
         .panel { background-color: #111827; border: 1px solid #1f1f23; border-radius: 10px; padding: 20px; flex: 1; }
         .right-column-stack { flex: 1; display: flex; flex-direction: column; gap: 25px; }
@@ -359,10 +331,10 @@ DASHBOARD_HTML = """
 <body>
     <div class="container">
         <div class="header">
-            <div><h1>IG Sentiment Matrix Terminal</h1><div style="font-size: 12px; color: #64748b;">Active Anchor: {{ data.baseline_set_at }}</div></div>
+            <div><h1>IG Client Sentiment Matrix Terminal</h1><div style="font-size: 12px; color: #64748b;">Active Anchor: {{ data.baseline_set_at }}</div></div>
             <div style="text-align: right; font-size: 12px; color: #64748b;">Sync: {{ data.api_sync_time }}<br>NY Time: {{ data.ny_time }}</div>
         </div>
-
+        
         <div class="session-tracker-bar">
             <div class="session-card {{ 'active-session-live' if data.active_session == 'ASIA' else '' }}">ASIA SESSION OPEN</div>
             <div class="session-card {{ 'active-session-live' if data.active_session == 'LONDON' else '' }}">LONDON SESSION OPEN</div>
@@ -382,7 +354,7 @@ DASHBOARD_HTML = """
                     <div class="grid-row" style="margin-top:10px;">{% for item in data.bottom_4_down %}<div class="grid-box border-down"><span class="currency-txt">{{ item.currency }}</span><span class="value-box" style="color: #ef4444;">{{ item.value }}</span><span class="badge" style="color:#ef4444;">DOWN</span></div>{% endfor %}</div>
                 </div>
                 <div class="panel">
-                    <h2>Absolute Retail Positioning Bias (Client Count)</h2>
+                    <h2>Absolute Retail Positioning Bias (Total Inventory)</h2>
                     <div class="bias-list">
                         {% for item in data.absolute_bias %}
                         <div class="data-row">
@@ -408,4 +380,4 @@ def index():
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 7860)))
+    app.run(host="0.0.0.0", port=7860)
