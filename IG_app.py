@@ -27,15 +27,13 @@ baseline_collection = db["session_baselines"]
 daily_baseline_collection = db["daily_baselines"]
 cache_collection = db["api_cache"]
 
-# IG "market IDs" for FX majors + gold. VERIFY THESE against IG's own
-# /markets?searchTerm= endpoint for your account before relying on them --
-# gold in particular is sometimes listed under a different marketId
-# depending on the instrument set your account has access to (this maps
-# it to "GOLD" as a reasonable starting guess, not a confirmed value).
+# IG "market IDs" for FX majors + gold. Gold confirmed via the API
+# Companion as "GC" (not "GOLD", which returns a valid 200 but always
+# 0.0/0.0 -- that marketId exists but carries no sentiment coverage).
 IG_SYMBOL_MAP = {
     "EURUSD": "EURUSD", "GBPUSD": "GBPUSD", "AUDUSD": "AUDUSD",
     "NZDUSD": "NZDUSD", "USDCHF": "USDCHF", "USDCAD": "USDCAD",
-    "USDJPY": "USDJPY", "XAUUSD": "GOLD"
+    "USDJPY": "USDJPY", "XAUUSD": "GC"
 }
 
 # --- HELPER: SCHEMA-AGNOSTIC DATA RETRIEVAL ---
