@@ -14,7 +14,7 @@ MONGO_URI = os.environ.get('MONGO_URI')
 IG_API_KEY = os.environ.get('IG_API_KEY')
 IG_USERNAME = os.environ.get('IG_USERNAME')
 IG_PASSWORD = os.environ.get('IG_PASSWORD')
-IG_API_URL = os.environ.get('IG_API_URL', 'https://demo-api.ig.com/gateway/deal') # Use https://demo-api.ig.com/gateway/deal for demo
+IG_API_URL = os.environ.get('IG_API_URL', 'https://demo-api.ig.com/gateway/deal')
 
 # --- MONGO DATABASE CONFIGURATION ---
 client = MongoClient(MONGO_URI if MONGO_URI else "mongodb://localhost:27017/")
@@ -33,21 +33,17 @@ IG_SYMBOL_MAP = {
     "USDCHF": "USDCHF",
     "USDCAD": "USDCAD",
     "USDJPY": "USDJPY",
-    "XAUUSD": "GC"  # IG uses 'GC' for Gold sentiment
+    "XAUUSD": "GC"  # IG uses 'GC' for Gold
 }
 
-# Global session token cache for IG API
 IG_SESSION_TOKENS = {"cst": None, "x_security_token": None}
 
-# --- HELPER: SCHEMA-AGNOSTIC DATA RETRIEVAL ---
 def get_safe_volume(data_dict, primary_key, secondary_key, fallback_value):
-    """Retrieves volume data regardless of key naming schema (long/longVolume)."""
     val = data_dict.get(primary_key)
     if val is None:
         val = data_dict.get(secondary_key)
     return float(val) if val is not None else float(fallback_value)
 
-# --- THREADING ENGINE ---
 background_engine_thread = None
 
 @app.before_request
@@ -85,9 +81,7 @@ def get_current_session_details(ny_dt):
 def clean_symbol_key(key_str):
     return re.sub(r'[^a-zA-Z]', '', str(key_str)).lower()
 
-# --- IG REST API CLIENT ---
 def authenticate_ig_session():
-    """Authenticates with IG API and captures CST and X-SECURITY-TOKEN headers."""
     try:
         url = f"{IG_API_URL}/session"
         headers = {
@@ -113,7 +107,6 @@ def authenticate_ig_session():
         return None, None
 
 def fetch_ig_client_sentiment():
-    """Fetches real-time retail client sentiment percentages from IG."""
     cst = IG_SESSION_TOKENS.get("cst")
     x_sec = IG_SESSION_TOKENS.get("x_security_token")
     
@@ -134,7 +127,6 @@ def fetch_ig_client_sentiment():
     try:
         res = requests.get(url, headers=headers, timeout=10)
         
-        # If session expired (401), re-authenticate once
         if res.status_code == 401:
             cst, x_sec = authenticate_ig_session()
             if not cst: return None
@@ -162,7 +154,6 @@ def fetch_ig_client_sentiment():
         print(f"IG Fetch Exception: {str(e)}")
         return None
 
-# --- BACKGROUND AUTOMATION ENGINE ---
 def run_background_state_scheduler():
     while True:
         try:
@@ -170,7 +161,6 @@ def run_background_state_scheduler():
             current_date_str = ny_now.strftime("%Y-%m-%d")
             current_session_label, session_anchor_hour = get_current_session_details(ny_now)
             
-            # 1. Fetch Fresh IG Sentiment Data
             symbols = fetch_ig_client_sentiment()
             
             if symbols:
@@ -179,7 +169,6 @@ def run_background_state_scheduler():
                     "live_pairs": symbols
                 }, "state_doc")
 
-            # 2. Session Anchor Logic (Session Open Reset)
             stored_baseline = load_db_document(baseline_collection)
             if symbols and stored_baseline.get("active_session") != current_session_label:
                 save_db_document(baseline_collection, {
@@ -189,7 +178,6 @@ def run_background_state_scheduler():
                     "volumes": symbols
                 }, "state_doc")
 
-            # 3. Daily Anchor Logic (5 PM NY Reset)
             stored_daily_baseline = load_db_document(daily_baseline_collection, "daily_state_doc")
             current_daily_anchor_date = ny_now.strftime("%Y-%m-%d") if ny_now.hour >= 17 else (ny_now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
             
@@ -204,10 +192,7 @@ def run_background_state_scheduler():
             print(f"Scheduler Loop Error: {str(e)}")
         time.sleep(60)
 
-# --- SENTIMENT MATRIX ENGINE ---
 def process_sentiment_matrix():
-    SCALE_FACTOR = 1000 
-    
     ny_now = get_ny_time()
     cached_data = load_db_document(cache_collection)
     live_pairs = {str(k): v for k, v in cached_data.get("live_pairs", {}).items()}
@@ -229,18 +214,15 @@ def process_sentiment_matrix():
         l_long, l_short = float(live.get("long", 0)), float(live.get("short", 0))
         total_live = l_long + l_short
         
-        # Retrieve baseline documents safely
         b_val = baseline_volumes.get(name, {})
         d_val = daily_baseline_volumes.get(name, {})
         
-        # Schema-Agnostic extraction via helper
         b_long = get_safe_volume(b_val, "long", "longVolume", l_long)
         b_short = get_safe_volume(b_val, "short", "shortVolume", l_short)
         
         d_long = get_safe_volume(d_val, "longVolume", "long", l_long)
         d_short = get_safe_volume(d_val, "shortVolume", "short", l_short)
         
-        # Calculate Delta Logic
         if cleaned_name == "xauusd":
             if total_live > 0: abs_long_pct_sum["GOLD"] = (l_long / total_live)
             abs_pair_counts["GOLD"] = 1
@@ -258,15 +240,12 @@ def process_sentiment_matrix():
                 abs_long_pct_sum[base] += (l_long / total_live); abs_pair_counts[base] += 1
                 abs_long_pct_sum[quote] += (l_short / total_live); abs_pair_counts[quote] += 1
             
-            # Session Delta
             sess_long_delta[base] += (l_long - b_long); sess_short_delta[base] += (l_short - b_short)
             sess_long_delta[quote] += (l_short - b_short); sess_short_delta[quote] += (l_long - b_long)
 
-            # Daily Delta
             daily_long_delta[base] += (l_long - d_long); daily_short_delta[base] += (l_short - d_short)
             daily_long_delta[quote] += (l_short - d_short); daily_short_delta[quote] += (l_long - d_long)
 
-    # --- FORMATTING OUTPUT ---
     currency_scores, daily_currency_scores, bias_output = {}, {}, []
     
     for cur in tracked_assets:
@@ -275,13 +254,14 @@ def process_sentiment_matrix():
         display_name = "Gold" if cur == "GOLD" else cur
         bias_output.append({"currency": display_name, "long_pct": round(inv_long_ratio * 100, 1), "bias_label": "BULLISH" if inv_long_ratio >= 0.5 else "BEARISH"})
 
-        net_shift = (sess_long_delta[cur] - sess_short_delta[cur]) * SCALE_FACTOR
-        formatted_score = int(round(net_shift, 0))
+        # Normal unmultiplied percentage delta calculation
+        net_shift = sess_long_delta[cur] - sess_short_delta[cur]
+        formatted_score = round(net_shift, 2)
         status_str = "UP" if formatted_score > 0 else ("DOWN" if formatted_score < 0 else ("UP" if inv_long_ratio >= 0.5 else "DOWN"))
         currency_scores[cur] = {"currency": display_name, "value": abs(formatted_score), "status": status_str}
 
-        d_net_shift = (daily_long_delta[cur] - daily_short_delta[cur]) * SCALE_FACTOR
-        d_formatted_score = int(round(d_net_shift, 0))
+        d_net_shift = daily_long_delta[cur] - daily_short_delta[cur]
+        d_formatted_score = round(d_net_shift, 2)
         d_status_str = "UP" if d_formatted_score > 0 else ("DOWN" if d_formatted_score < 0 else ("UP" if inv_long_ratio >= 0.5 else "DOWN"))
         daily_currency_scores[cur] = {"currency": display_name, "value": abs(d_formatted_score), "status": d_status_str}
     
@@ -376,8 +356,10 @@ DASHBOARD_HTML = """
 
 @app.route('/')
 def index():
-    try: return render_template_string(DASHBOARD_HTML, data=process_sentiment_matrix())
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    try: 
+        return render_template_string(DASHBOARD_HTML, data=process_sentiment_matrix())
+    except Exception as e: 
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=7860)
