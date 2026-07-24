@@ -38,6 +38,11 @@ IG_SYMBOL_MAP = {
 }
 
 IG_SESSION_TOKENS = {"cst": None, "x_security_token": None}
+# Tracks repeated auth failures so a bad credential (e.g. a typo after a
+# redeploy) can't retry every 60-second cycle indefinitely -- that pattern
+# is what most likely caused the earlier "multiple failed login attempts"
+# suspension.
+IG_AUTH_FAILURE_STATE = {"last_failure_at": None, "consecutive_failures": 0}
 
 def get_safe_volume(data_dict, primary_key, secondary_key, fallback_value):
     val = data_dict.get(primary_key)
@@ -99,12 +104,18 @@ def authenticate_ig_session():
             x_sec = res.headers.get("X-SECURITY-TOKEN")
             IG_SESSION_TOKENS["cst"] = cst
             IG_SESSION_TOKENS["x_security_token"] = x_sec
+            IG_AUTH_FAILURE_STATE["consecutive_failures"] = 0
+            IG_AUTH_FAILURE_STATE["last_failure_at"] = None
             return cst, x_sec
         else:
             print(f"IG Auth Failed: Status {res.status_code} - {res.text}")
+            IG_AUTH_FAILURE_STATE["consecutive_failures"] += 1
+            IG_AUTH_FAILURE_STATE["last_failure_at"] = datetime.datetime.now(datetime.timezone.utc)
             return None, None
     except Exception as e:
         print(f"IG Auth Exception: {str(e)}")
+        IG_AUTH_FAILURE_STATE["consecutive_failures"] += 1
+        IG_AUTH_FAILURE_STATE["last_failure_at"] = datetime.datetime.now(datetime.timezone.utc)
         return None, None
 
 def fetch_ig_client_sentiment():
@@ -112,6 +123,17 @@ def fetch_ig_client_sentiment():
     x_sec = IG_SESSION_TOKENS.get("x_security_token")
     
     if not cst or not x_sec:
+        failures = IG_AUTH_FAILURE_STATE["consecutive_failures"]
+        last_failure = IG_AUTH_FAILURE_STATE["last_failure_at"]
+        if failures > 0 and last_failure:
+            # Backoff: 1 min, 2 min, 4 min... capped at 30 min between retries,
+            # instead of hammering /session every single 60-second cycle.
+            cooldown_seconds = min(60 * (2 ** (failures - 1)), 1800)
+            elapsed = (datetime.datetime.now(datetime.timezone.utc) - last_failure).total_seconds()
+            if elapsed < cooldown_seconds:
+                print(f"IG Auth: skipping retry, {int(cooldown_seconds - elapsed)}s left in backoff "
+                      f"({failures} consecutive failures)")
+                return None
         cst, x_sec = authenticate_ig_session()
         if not cst: return None
 
