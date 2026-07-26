@@ -15,7 +15,7 @@ MONGO_URI = os.environ.get('MONGO_URI')
 IG_API_KEY = os.environ.get('IG_API_KEY')
 IG_USERNAME = os.environ.get('IG_USERNAME')
 IG_PASSWORD = os.environ.get('IG_PASSWORD')
-IG_API_URL = os.environ.get('IG_API_URL', 'https://demo-api.ig.com/gateway/deal')
+IG_API_URL = os.environ.get('IG_API_URL', 'https://api.ig.com/gateway/deal')
 
 # --- MONGO DATABASE CONFIGURATION ---
 client = MongoClient(MONGO_URI if MONGO_URI else "mongodb://localhost:27017/")
