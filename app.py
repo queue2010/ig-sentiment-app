@@ -27,6 +27,7 @@ cache_collection = db["api_cache"]
 
 # --- IG MARKET ID MAPPING ---
 IG_SYMBOL_MAP = {
+    # Majors (7)
     "EURUSD": "EURUSD",
     "GBPUSD": "GBPUSD",
     "AUDUSD": "AUDUSD",
@@ -34,6 +35,31 @@ IG_SYMBOL_MAP = {
     "USDCHF": "USDCHF",
     "USDCAD": "USDCAD",
     "USDJPY": "USDJPY",
+    # Crosses (21) -- completes the full 8-currency matrix (8 choose 2 = 28
+    # pairs total) so every currency's index is built from all 7 pairs it
+    # appears in, the same way MyFXBook's 28-pair index works.
+    "EURGBP": "EURGBP",
+    "EURAUD": "EURAUD",
+    "EURNZD": "EURNZD",
+    "EURCAD": "EURCAD",
+    "EURCHF": "EURCHF",
+    "EURJPY": "EURJPY",
+    "GBPAUD": "GBPAUD",
+    "GBPNZD": "GBPNZD",
+    "GBPCAD": "GBPCAD",
+    "GBPCHF": "GBPCHF",
+    "GBPJPY": "GBPJPY",
+    "AUDCAD": "AUDCAD",
+    "AUDCHF": "AUDCHF",
+    "AUDJPY": "AUDJPY",
+    "AUDNZD": "AUDNZD",
+    "NZDCAD": "NZDCAD",
+    "NZDCHF": "NZDCHF",
+    "NZDJPY": "NZDJPY",
+    "CADCHF": "CADCHF",
+    "CADJPY": "CADJPY",
+    "CHFJPY": "CHFJPY",
+    # Gold
     "XAUUSD": "GC"  # IG uses 'GC' for Gold
 }
 
