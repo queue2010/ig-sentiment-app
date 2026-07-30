@@ -486,6 +486,27 @@ DASHBOARD_HTML = """
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
     <script>
         (function() {
+            function computeSlopeLine(values) {
+                // NEW: simple least-squares linear regression over the point
+                // index (x) and combined value (y), used only to draw a
+                // trend line -- doesn't affect any stored or displayed data.
+                var n = values.length;
+                if (n < 2) return values.slice();
+                var sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+                for (var i = 0; i < n; i++) {
+                    sumX += i;
+                    sumY += values[i];
+                    sumXY += i * values[i];
+                    sumXX += i * i;
+                }
+                var denom = (n * sumXX - sumX * sumX);
+                var slope = denom !== 0 ? (n * sumXY - sumX * sumY) / denom : 0;
+                var intercept = (sumY - slope * sumX) / n;
+                var fitted = [];
+                for (var j = 0; j < n; j++) fitted.push(slope * j + intercept);
+                return fitted;
+            }
+
             var chartHistory = {{ chart_history | tojson }};
             var currencies = ['EUR','GBP','USD','AUD','NZD','CAD','CHF','JPY','GOLD'];
             currencies.forEach(function(cur) {
@@ -496,6 +517,7 @@ DASHBOARD_HTML = """
                 var labels = points.map(function(p) { return p.t; });
                 var lastVal = values.length ? values[values.length - 1] : 0;
                 var lineColor = lastVal >= 0 ? '#10b981' : '#ef4444';
+                var slopeLine = computeSlopeLine(values);
                 new Chart(canvas, {
                     type: 'line',
                     data: {
@@ -515,6 +537,15 @@ DASHBOARD_HTML = """
                                 borderColor: 'rgba(255, 255, 255, 0.5)',
                                 borderWidth: 1,
                                 borderDash: [4, 4],
+                                pointRadius: 0,
+                                fill: false,
+                                tension: 0
+                            },
+                            {
+                                // NEW: slope/trend line, very transparent yellow
+                                data: slopeLine,
+                                borderColor: 'rgba(234, 179, 8, 0.25)',
+                                borderWidth: 2,
                                 pointRadius: 0,
                                 fill: false,
                                 tension: 0
