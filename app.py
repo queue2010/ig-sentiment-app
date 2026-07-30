@@ -24,6 +24,7 @@ db = client["ig_sentiment_db"]
 baseline_collection = db["session_baselines"]
 daily_baseline_collection = db["daily_baselines"]
 cache_collection = db["api_cache"]
+chart_history_collection = db["session_chart_history"]  # NEW: powers the session trend chart
 
 # --- IG MARKET ID MAPPING ---
 IG_SYMBOL_MAP = {
@@ -203,6 +204,69 @@ def fetch_ig_client_sentiment():
         print(f"IG Fetch Exception: {str(e)}")
         return None
 
+def record_chart_snapshot(symbols, current_session_label, current_date_str, ny_now):
+    """NEW, additive-only function for the session trend chart. Computes the
+    same 'combined value' (signed session delta + signed daily delta) that
+    process_sentiment_matrix already computes for the UP/DOWN panels, but
+    keeps its own independent copy of the math so nothing in the existing
+    dashboard logic is touched. Resets each currency's point history the
+    moment the session label changes, matching the same session boundaries
+    the rest of the app already uses."""
+    try:
+        stored_baseline = load_db_document(baseline_collection)
+        baseline_volumes = stored_baseline.get("volumes", {})
+        stored_daily_baseline = load_db_document(daily_baseline_collection, "daily_state_doc")
+        daily_baseline_volumes = stored_daily_baseline.get("volumes", {})
+
+        majors = ["EUR", "GBP", "USD", "AUD", "NZD", "CAD", "CHF", "JPY"]
+        tracked_assets = majors + ["GOLD"]
+
+        sess_long_delta, sess_short_delta = {a: 0.0 for a in tracked_assets}, {a: 0.0 for a in tracked_assets}
+        daily_long_delta, daily_short_delta = {a: 0.0 for a in tracked_assets}, {a: 0.0 for a in tracked_assets}
+
+        for name, live in symbols.items():
+            cleaned_name = clean_symbol_key(name)
+            l_long, l_short = float(live.get("long", 0)), float(live.get("short", 0))
+
+            b_val = baseline_volumes.get(name, {})
+            d_val = daily_baseline_volumes.get(name, {})
+            b_long = get_safe_volume(b_val, "long", "longVolume", l_long)
+            b_short = get_safe_volume(b_val, "short", "shortVolume", l_short)
+            d_long = get_safe_volume(d_val, "longVolume", "long", l_long)
+            d_short = get_safe_volume(d_val, "shortVolume", "short", l_short)
+
+            if cleaned_name == "xauusd":
+                sess_long_delta["GOLD"] = (l_long - b_long); sess_short_delta["GOLD"] = (l_short - b_short)
+                daily_long_delta["GOLD"] = (l_long - d_long); daily_short_delta["GOLD"] = (l_short - d_short)
+                continue
+
+            if len(cleaned_name) != 6: continue
+            base, quote = cleaned_name[0:3].upper(), cleaned_name[3:6].upper()
+            if base in majors and quote in majors:
+                sess_long_delta[base] += (l_long - b_long); sess_short_delta[base] += (l_short - b_short)
+                sess_long_delta[quote] += (l_short - b_short); sess_short_delta[quote] += (l_long - b_long)
+                daily_long_delta[base] += (l_long - d_long); daily_short_delta[base] += (l_short - d_short)
+                daily_long_delta[quote] += (l_short - d_short); daily_short_delta[quote] += (l_long - d_long)
+
+        stored_chart = load_db_document(chart_history_collection, "chart_state_doc")
+        points = stored_chart.get("points", {}) if stored_chart.get("session") == current_session_label else {}
+
+        timestamp = ny_now.strftime("%H:%M:%S")
+        for cur in tracked_assets:
+            net_shift = round(sess_long_delta[cur] - sess_short_delta[cur], 2)
+            d_net_shift = round(daily_long_delta[cur] - daily_short_delta[cur], 2)
+            combined_value = round(net_shift + d_net_shift, 2)
+            points.setdefault(cur, []).append({"t": timestamp, "v": combined_value})
+            points[cur] = points[cur][-600:]  # cap history so the doc doesn't grow unbounded across a long session
+
+        save_db_document(chart_history_collection, {
+            "session": current_session_label,
+            "session_date": current_date_str,
+            "points": points
+        }, "chart_state_doc")
+    except Exception as e:
+        print(f"Chart Snapshot Error: {str(e)}")
+
 def run_background_state_scheduler():
     while True:
         try:
@@ -236,6 +300,9 @@ def run_background_state_scheduler():
                     "volumes": symbols, 
                     "captured_at": ny_now.strftime("%Y-%m-%d %H:%M:%S")
                 }, "daily_state_doc")
+
+            if symbols:
+                record_chart_snapshot(symbols, current_session_label, current_date_str, ny_now)  # NEW
 
         except Exception as e:
             print(f"Scheduler Loop Error: {str(e)}")
@@ -355,6 +422,11 @@ DASHBOARD_HTML = """
         .data-row { display: flex; align-items: center; padding: 11px 10px; border-bottom: 1px solid #1f2937; gap: 12px; }
         .bar-container { width: 100px; background: #334155; height: 8px; border-radius: 4px; }
         .bar-fill { height: 100%; border-radius: 4px; }
+        /* NEW: session trend chart styles */
+        .chart-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-top: 5px; }
+        .chart-box { background-color: #1f2937; border-radius: 8px; padding: 12px; }
+        .chart-label { font-size: 13px; font-weight: 700; color: #e2e8f0; margin-bottom: 6px; }
+        .chart-canvas-wrap { position: relative; height: 90px; }
     </style>
 </head>
 <body>
@@ -397,7 +469,59 @@ DASHBOARD_HTML = """
                 </div>
             </div>
         </div>
+
+        <!-- NEW: Session Sentiment Trend chart -->
+        <div class="panel" style="margin-top: 25px;">
+            <h2>Session Sentiment Trend (Daily + Session Combined, resets each new session)</h2>
+            <div class="chart-grid">
+                {% for cur in ['EUR','GBP','USD','AUD','NZD','CAD','CHF','JPY','GOLD'] %}
+                <div class="chart-box">
+                    <div class="chart-label">{{ 'Gold' if cur == 'GOLD' else cur }}</div>
+                    <div class="chart-canvas-wrap"><canvas id="chart-{{ cur }}"></canvas></div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
     </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+    <script>
+        (function() {
+            var chartHistory = {{ chart_history | tojson }};
+            var currencies = ['EUR','GBP','USD','AUD','NZD','CAD','CHF','JPY','GOLD'];
+            currencies.forEach(function(cur) {
+                var points = chartHistory[cur] || [];
+                var canvas = document.getElementById('chart-' + cur);
+                if (!canvas) return;
+                var values = points.map(function(p) { return p.v; });
+                var labels = points.map(function(p) { return p.t; });
+                var lastVal = values.length ? values[values.length - 1] : 0;
+                var lineColor = lastVal >= 0 ? '#10b981' : '#ef4444';
+                new Chart(canvas, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            data: values,
+                            borderColor: lineColor,
+                            backgroundColor: 'transparent',
+                            borderWidth: 2,
+                            pointRadius: 0,
+                            tension: 0.3
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { display: false } },
+                        scales: {
+                            x: { display: false },
+                            y: { grid: { color: '#1f2937' }, ticks: { color: '#64748b', font: { size: 9 } } }
+                        }
+                    }
+                });
+            });
+        })();
+    </script>
     <script>setInterval(function(){ location.reload(); }, 60000);</script>
 </body>
 </html>
@@ -406,7 +530,8 @@ DASHBOARD_HTML = """
 @app.route('/')
 def index():
     try: 
-        return render_template_string(DASHBOARD_HTML, data=process_sentiment_matrix())
+        chart_data = load_db_document(chart_history_collection, "chart_state_doc").get("points", {})  # NEW
+        return render_template_string(DASHBOARD_HTML, data=process_sentiment_matrix(), chart_history=chart_data)
     except Exception as e: 
         return jsonify({"error": str(e)}), 500
 
