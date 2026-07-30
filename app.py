@@ -515,24 +515,16 @@ DASHBOARD_HTML = """
                 if (!canvas) return;
                 var values = points.map(function(p) { return p.v; });
                 var labels = points.map(function(p) { return p.t; });
-                var lastVal = values.length ? values[values.length - 1] : 0;
-                var lineColor = lastVal >= 0 ? '#10b981' : '#ef4444';
                 var slopeLine = computeSlopeLine(values);
+                var isUpward = slopeLine.length >= 2 && slopeLine[slopeLine.length - 1] > slopeLine[0];
+                var slopeColor = isUpward ? '#10b981' : '#ef4444';
                 new Chart(canvas, {
                     type: 'line',
                     data: {
                         labels: labels,
                         datasets: [
                             {
-                                data: values,
-                                borderColor: lineColor,
-                                backgroundColor: 'transparent',
-                                borderWidth: 2,
-                                pointRadius: 0,
-                                tension: 0.3
-                            },
-                            {
-                                // NEW: zero reference line
+                                // zero reference line
                                 data: labels.map(function() { return 0; }),
                                 borderColor: 'rgba(255, 255, 255, 0.5)',
                                 borderWidth: 1,
@@ -542,9 +534,9 @@ DASHBOARD_HTML = """
                                 tension: 0
                             },
                             {
-                                // NEW: slope/trend line, very transparent yellow
+                                // slope/trend line, solid green (up) or red (down)
                                 data: slopeLine,
-                                borderColor: 'rgba(234, 179, 8, 0.25)',
+                                borderColor: slopeColor,
                                 borderWidth: 2,
                                 pointRadius: 0,
                                 fill: false,
