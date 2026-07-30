@@ -500,14 +500,26 @@ DASHBOARD_HTML = """
                     type: 'line',
                     data: {
                         labels: labels,
-                        datasets: [{
-                            data: values,
-                            borderColor: lineColor,
-                            backgroundColor: 'transparent',
-                            borderWidth: 2,
-                            pointRadius: 0,
-                            tension: 0.3
-                        }]
+                        datasets: [
+                            {
+                                data: values,
+                                borderColor: lineColor,
+                                backgroundColor: 'transparent',
+                                borderWidth: 2,
+                                pointRadius: 0,
+                                tension: 0.3
+                            },
+                            {
+                                // NEW: zero reference line
+                                data: labels.map(function() { return 0; }),
+                                borderColor: 'rgba(255, 255, 255, 0.5)',
+                                borderWidth: 1,
+                                borderDash: [4, 4],
+                                pointRadius: 0,
+                                fill: false,
+                                tension: 0
+                            }
+                        ]
                     },
                     options: {
                         responsive: true,
