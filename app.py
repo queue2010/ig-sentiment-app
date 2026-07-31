@@ -273,8 +273,22 @@ def run_background_state_scheduler():
             ny_now = get_ny_time()
             current_date_str = ny_now.strftime("%Y-%m-%d")
             current_session_label, session_anchor_hour = get_current_session_details(ny_now)
-            
-            symbols = fetch_ig_client_sentiment()
+
+            # Weekend market-closed pause: Forex is shut from Friday 5pm NY
+            # through Sunday 5pm NY. Fetching every 60s through that whole
+            # stretch just re-pulls the same frozen numbers -- skip it.
+            weekday = ny_now.weekday()  # Monday=0 ... Sunday=6
+            market_closed_weekend = (
+                weekday == 5 or
+                (weekday == 4 and ny_now.hour >= 17) or
+                (weekday == 6 and ny_now.hour < 17)
+            )
+
+            if market_closed_weekend:
+                symbols = None
+                print("Weekend pause: market closed, skipping IG fetch until Sunday 5pm NY.")
+            else:
+                symbols = fetch_ig_client_sentiment()
             
             if symbols:
                 save_db_document(cache_collection, {
@@ -283,7 +297,11 @@ def run_background_state_scheduler():
                 }, "state_doc")
 
             stored_baseline = load_db_document(baseline_collection)
-            if symbols and stored_baseline.get("active_session") != current_session_label:
+            session_did_change = (
+                stored_baseline.get("active_session") != current_session_label or
+                (stored_baseline.get("baseline_date") != current_date_str and current_session_label == "ASIA")
+            )
+            if symbols and session_did_change:
                 save_db_document(baseline_collection, {
                     "baseline_date": current_date_str,
                     "active_session": current_session_label,
