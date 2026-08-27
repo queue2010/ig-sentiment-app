@@ -526,19 +526,10 @@ DASHBOARD_HTML = """
                                 tension: 0
                             },
                             {
-                                label: 'Actual Sentiment',
-                                data: values,
-                                borderColor: 'rgba(148, 163, 184, 0.4)',
-                                borderWidth: 1.5,
-                                pointRadius: 0,
-                                fill: false,
-                                tension: 0.2
-                            },
-                            {
                                 label: 'Slope Trend',
                                 data: slopeLine,
                                 borderColor: slopeColor,
-                                borderWidth: 2,
+                                borderWidth: 2.5,
                                 pointRadius: 0,
                                 fill: false,
                                 tension: 0
