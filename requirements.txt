@@ -3,5 +3,3 @@ pymongo
 requests
 dnspython
 gunicorn
-cloudscraper
-yfinance
