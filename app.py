@@ -423,7 +423,7 @@ DASHBOARD_HTML = """
         .chart-box { background-color: #1f2937; border-radius: 8px; padding: 12px; position: relative; }
         .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
         .chart-label { font-size: 13px; font-weight: 700; color: #e2e8f0; }
-        .metrics-tag { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 3px; background: #111827; }
+        .metrics-tag { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 3px; background: #111827; letter-spacing: 0.5px; }
         .chart-canvas-wrap { position: relative; height: 90px; }
     </style>
 </head>
@@ -469,13 +469,13 @@ DASHBOARD_HTML = """
         </div>
 
         <div class="panel" style="margin-top: 25px;">
-            <h2>Statistical Session Sentiment Engine (Dual WLS, R², t-Stat, Δ'/Δ'')</h2>
+            <h2>Session Sentiment Slope Trends</h2>
             <div class="chart-grid">
                 {% for cur in ['EUR','GBP','USD','AUD','NZD','CAD','CHF','JPY','GOLD'] %}
                 <div class="chart-box">
                     <div class="chart-header">
                         <div class="chart-label">{{ 'Gold' if cur == 'GOLD' else cur }}</div>
-                        <div class="metrics-tag" id="tag-{{ cur }}">FILTERING...</div>
+                        <div class="metrics-tag" id="tag-{{ cur }}">NEUTRAL</div>
                     </div>
                     <div class="chart-canvas-wrap"><canvas id="chart-{{ cur }}"></canvas></div>
                 </div>
@@ -486,7 +486,6 @@ DASHBOARD_HTML = """
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
     <script>
         (function() {
-            // --- STATISTICAL ENGINE: WEIGHTED LEAST SQUARES (WLS), R², t-STAT ---
             function computeWLS(values, lambda) {
                 var n = values.length;
                 if (n < 2) return { slope: 0, fitted: values.slice(), R2: 0, t_stat: 0 };
@@ -513,10 +512,9 @@ DASHBOARD_HTML = """
 
                 var fitted = [];
                 var SSres = 0;
-                var y_bar_w = Sy / W;
                 var SStot = Syy - (Sy * Sy) / W;
-
                 var unweighted_SSres = 0;
+
                 for (var j = 0; j < n; j++) {
                     var y_hat = slope * j + intercept;
                     fitted.push(y_hat);
@@ -526,7 +524,6 @@ DASHBOARD_HTML = """
 
                 var R2 = SStot > 0 ? Math.max(0, 1 - (SSres / SStot)) : 0;
 
-                // Standard Error of Slope & t-Statistic
                 var s2 = n > 2 ? unweighted_SSres / (n - 2) : 0;
                 var x_bar = (n - 1) / 2;
                 var Sxx_unweighted = 0;
@@ -536,16 +533,6 @@ DASHBOARD_HTML = """
                 var t_stat = SE_m > 0 ? slope / SE_m : 0;
 
                 return { slope: slope, fitted: fitted, R2: R2, t_stat: t_stat };
-            }
-
-            // --- 1st & 2nd DERIVATIVES (POSITIONING VELOCITY Δ' & ACCELERATION Δ'') ---
-            function computeDerivatives(values) {
-                var n = values.length;
-                if (n < 5) return { velocity: 0, acceleration: 0 };
-                var velocity = (values[n - 1] - values[n - 5]) / 5.0;
-                var prevVelocity = n >= 10 ? (values[n - 5] - values[n - 10]) / 5.0 : velocity;
-                var acceleration = velocity - prevVelocity;
-                return { velocity: velocity, acceleration: acceleration };
             }
 
             var chartHistory = {{ chart_history | tojson }};
@@ -560,27 +547,31 @@ DASHBOARD_HTML = """
                 var values = points.map(function(p) { return p.v; });
                 var labels = points.map(function(p) { return p.t; });
 
-                // Multi-Timeframe WLS Regressions
-                var fastWLS = computeWLS(values, 0.08);  // Fast (~15m decay)
-                var slowWLS = computeWLS(values, 0.015); // Slow (~1h session decay)
-                var deriv = computeDerivatives(values);
+                var fastWLS = computeWLS(values, 0.08);
+                var slowWLS = computeWLS(values, 0.015);
 
-                // Multi-Condition Signal Filtering
                 var sameSign = (fastWLS.slope * slowWLS.slope > 0);
                 var linearThreshold = 0.35;
                 var significant = Math.abs(fastWLS.t_stat) > 1.96;
                 var highConviction = sameSign && (fastWLS.R2 >= linearThreshold) && significant;
 
-                var slopeColor = '#64748b'; // Neutral Gray default
-                var statusText = 'NEUTRAL (R²=' + fastWLS.R2.toFixed(2) + ')';
+                var slopeColor = '#64748b'; // Fallback Neutral Gray
+                var statusText = 'NEUTRAL';
 
                 if (highConviction) {
                     if (fastWLS.slope > 0) {
-                        slopeColor = '#10b981'; // Bullish Signal
-                        statusText = 'BUY (t=' + fastWLS.t_stat.toFixed(1) + '|R²=' + fastWLS.R2.toFixed(2) + ')';
+                        slopeColor = '#10b981'; // Hard Green (Bullish High Conviction)
+                        statusText = 'BULLISH';
                     } else {
-                        slopeColor = '#ef4444'; // Bearish Signal
-                        statusText = 'SELL (t=' + fastWLS.t_stat.toFixed(1) + '|R²=' + fastWLS.R2.toFixed(2) + ')';
+                        slopeColor = '#ef4444'; // Hard Red (Bearish High Conviction)
+                        statusText = 'BEARISH';
+                    }
+                } else {
+                    statusText = 'NEUTRAL';
+                    if (fastWLS.slope > 0) {
+                        slopeColor = '#6ee7b7'; // Very Light Green (Neutral Upward Slope)
+                    } else if (fastWLS.slope < 0) {
+                        slopeColor = '#fca5a5'; // Very Light Red (Neutral Downward Slope)
                     }
                 }
 
@@ -602,25 +593,28 @@ DASHBOARD_HTML = """
                                 borderWidth: 1,
                                 borderDash: [3, 3],
                                 pointRadius: 0,
+                                pointHoverRadius: 0,
                                 fill: false,
                                 tension: 0
                             },
                             {
-                                label: 'Slow WLS Trend',
+                                label: 'Slow Trend',
                                 data: slowWLS.fitted,
                                 borderColor: 'rgba(148, 163, 184, 0.35)',
                                 borderWidth: 1.5,
                                 borderDash: [2, 2],
                                 pointRadius: 0,
+                                pointHoverRadius: 0,
                                 fill: false,
                                 tension: 0
                             },
                             {
-                                label: 'Fast WLS Signal',
+                                label: 'Slope Signal',
                                 data: fastWLS.fitted,
                                 borderColor: slopeColor,
                                 borderWidth: 2.5,
                                 pointRadius: 0,
+                                pointHoverRadius: 0,
                                 fill: false,
                                 tension: 0
                             }
@@ -629,7 +623,10 @@ DASHBOARD_HTML = """
                     options: {
                         responsive: true,
                         maintainAspectRatio: false,
-                        plugins: { legend: { display: false } },
+                        plugins: {
+                            legend: { display: false },
+                            tooltip: { enabled: false }
+                        },
                         scales: {
                             x: { display: false },
                             y: { grid: { color: '#1f2937' }, ticks: { color: '#64748b', font: { size: 9 } } }
