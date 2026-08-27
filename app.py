@@ -423,7 +423,6 @@ DASHBOARD_HTML = """
         .chart-box { background-color: #1f2937; border-radius: 8px; padding: 12px; position: relative; }
         .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
         .chart-label { font-size: 13px; font-weight: 700; color: #e2e8f0; }
-        .metrics-tag { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 3px; background: #111827; letter-spacing: 0.5px; }
         .chart-canvas-wrap { position: relative; height: 90px; }
     </style>
 </head>
@@ -475,7 +474,6 @@ DASHBOARD_HTML = """
                 <div class="chart-box">
                     <div class="chart-header">
                         <div class="chart-label">{{ 'Gold' if cur == 'GOLD' else cur }}</div>
-                        <div class="metrics-tag" id="tag-{{ cur }}">NEUTRAL</div>
                     </div>
                     <div class="chart-canvas-wrap"><canvas id="chart-{{ cur }}"></canvas></div>
                 </div>
@@ -541,7 +539,6 @@ DASHBOARD_HTML = """
             currencies.forEach(function(cur) {
                 var points = chartHistory[cur] || [];
                 var canvas = document.getElementById('chart-' + cur);
-                var tagEl = document.getElementById('tag-' + cur);
                 if (!canvas) return;
 
                 var values = points.map(function(p) { return p.v; });
@@ -556,29 +553,19 @@ DASHBOARD_HTML = """
                 var highConviction = sameSign && (fastWLS.R2 >= linearThreshold) && significant;
 
                 var slopeColor = '#64748b'; // Fallback Neutral Gray
-                var statusText = 'NEUTRAL';
 
                 if (highConviction) {
                     if (fastWLS.slope > 0) {
                         slopeColor = '#10b981'; // Hard Green (Bullish High Conviction)
-                        statusText = 'BULLISH';
                     } else {
                         slopeColor = '#ef4444'; // Hard Red (Bearish High Conviction)
-                        statusText = 'BEARISH';
                     }
                 } else {
-                    statusText = 'NEUTRAL';
                     if (fastWLS.slope > 0) {
                         slopeColor = '#6ee7b7'; // Very Light Green (Neutral Upward Slope)
                     } else if (fastWLS.slope < 0) {
                         slopeColor = '#fca5a5'; // Very Light Red (Neutral Downward Slope)
                     }
-                }
-
-                if (tagEl) {
-                    tagEl.innerText = statusText;
-                    tagEl.style.color = slopeColor;
-                    tagEl.style.border = '1px solid ' + slopeColor;
                 }
 
                 new Chart(canvas, {
