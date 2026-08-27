@@ -420,8 +420,10 @@ DASHBOARD_HTML = """
         .bar-container { width: 100px; background: #334155; height: 8px; border-radius: 4px; }
         .bar-fill { height: 100%; border-radius: 4px; }
         .chart-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-top: 5px; }
-        .chart-box { background-color: #1f2937; border-radius: 8px; padding: 12px; }
-        .chart-label { font-size: 13px; font-weight: 700; color: #e2e8f0; margin-bottom: 6px; }
+        .chart-box { background-color: #1f2937; border-radius: 8px; padding: 12px; position: relative; }
+        .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+        .chart-label { font-size: 13px; font-weight: 700; color: #e2e8f0; }
+        .metrics-tag { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 3px; background: #111827; }
         .chart-canvas-wrap { position: relative; height: 90px; }
     </style>
 </head>
@@ -467,11 +469,14 @@ DASHBOARD_HTML = """
         </div>
 
         <div class="panel" style="margin-top: 25px;">
-            <h2>Session Sentiment Trend (Daily + Session Combined, resets each new session)</h2>
+            <h2>Statistical Session Sentiment Engine (Dual WLS, R², t-Stat, Δ'/Δ'')</h2>
             <div class="chart-grid">
                 {% for cur in ['EUR','GBP','USD','AUD','NZD','CAD','CHF','JPY','GOLD'] %}
                 <div class="chart-box">
-                    <div class="chart-label">{{ 'Gold' if cur == 'GOLD' else cur }}</div>
+                    <div class="chart-header">
+                        <div class="chart-label">{{ 'Gold' if cur == 'GOLD' else cur }}</div>
+                        <div class="metrics-tag" id="tag-{{ cur }}">FILTERING...</div>
+                    </div>
                     <div class="chart-canvas-wrap"><canvas id="chart-{{ cur }}"></canvas></div>
                 </div>
                 {% endfor %}
@@ -481,53 +486,138 @@ DASHBOARD_HTML = """
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
     <script>
         (function() {
-            function computeSlopeLine(values) {
+            // --- STATISTICAL ENGINE: WEIGHTED LEAST SQUARES (WLS), R², t-STAT ---
+            function computeWLS(values, lambda) {
                 var n = values.length;
-                if (n < 2) return values.slice();
-                var sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+                if (n < 2) return { slope: 0, fitted: values.slice(), R2: 0, t_stat: 0 };
+
+                var W = 0, Sx = 0, Sy = 0, Sxx = 0, Sxy = 0, Syy = 0;
+                var weights = [];
+
                 for (var i = 0; i < n; i++) {
-                    sumX += i;
-                    sumY += values[i];
-                    sumXY += i * values[i];
-                    sumXX += i * i;
+                    var w = Math.exp(-lambda * (n - 1 - i));
+                    weights.push(w);
+                    var x = i;
+                    var y = values[i];
+                    W += w;
+                    Sx += w * x;
+                    Sy += w * y;
+                    Sxx += w * x * x;
+                    Sxy += w * x * y;
+                    Syy += w * y * y;
                 }
-                var denom = (n * sumXX - sumX * sumX);
-                var slope = denom !== 0 ? (n * sumXY - sumX * sumY) / denom : 0;
-                var intercept = (sumY - slope * sumX) / n;
+
+                var denom = (W * Sxx - Sx * Sx);
+                var slope = denom !== 0 ? (W * Sxy - Sx * Sy) / denom : 0;
+                var intercept = (Sy - slope * Sx) / W;
+
                 var fitted = [];
-                for (var j = 0; j < n; j++) fitted.push(slope * j + intercept);
-                return fitted;
+                var SSres = 0;
+                var y_bar_w = Sy / W;
+                var SStot = Syy - (Sy * Sy) / W;
+
+                var unweighted_SSres = 0;
+                for (var j = 0; j < n; j++) {
+                    var y_hat = slope * j + intercept;
+                    fitted.push(y_hat);
+                    SSres += weights[j] * Math.pow(values[j] - y_hat, 2);
+                    unweighted_SSres += Math.pow(values[j] - y_hat, 2);
+                }
+
+                var R2 = SStot > 0 ? Math.max(0, 1 - (SSres / SStot)) : 0;
+
+                // Standard Error of Slope & t-Statistic
+                var s2 = n > 2 ? unweighted_SSres / (n - 2) : 0;
+                var x_bar = (n - 1) / 2;
+                var Sxx_unweighted = 0;
+                for (var k = 0; k < n; k++) Sxx_unweighted += Math.pow(k - x_bar, 2);
+                
+                var SE_m = Sxx_unweighted > 0 ? Math.sqrt(s2 / Sxx_unweighted) : 0;
+                var t_stat = SE_m > 0 ? slope / SE_m : 0;
+
+                return { slope: slope, fitted: fitted, R2: R2, t_stat: t_stat };
+            }
+
+            // --- 1st & 2nd DERIVATIVES (POSITIONING VELOCITY Δ' & ACCELERATION Δ'') ---
+            function computeDerivatives(values) {
+                var n = values.length;
+                if (n < 5) return { velocity: 0, acceleration: 0 };
+                var velocity = (values[n - 1] - values[n - 5]) / 5.0;
+                var prevVelocity = n >= 10 ? (values[n - 5] - values[n - 10]) / 5.0 : velocity;
+                var acceleration = velocity - prevVelocity;
+                return { velocity: velocity, acceleration: acceleration };
             }
 
             var chartHistory = {{ chart_history | tojson }};
             var currencies = ['EUR','GBP','USD','AUD','NZD','CAD','CHF','JPY','GOLD'];
+
             currencies.forEach(function(cur) {
                 var points = chartHistory[cur] || [];
                 var canvas = document.getElementById('chart-' + cur);
+                var tagEl = document.getElementById('tag-' + cur);
                 if (!canvas) return;
+
                 var values = points.map(function(p) { return p.v; });
                 var labels = points.map(function(p) { return p.t; });
-                var slopeLine = computeSlopeLine(values);
-                var isUpward = slopeLine.length >= 2 && slopeLine[slopeLine.length - 1] >= slopeLine[0];
-                var slopeColor = isUpward ? '#10b981' : '#ef4444';
+
+                // Multi-Timeframe WLS Regressions
+                var fastWLS = computeWLS(values, 0.08);  // Fast (~15m decay)
+                var slowWLS = computeWLS(values, 0.015); // Slow (~1h session decay)
+                var deriv = computeDerivatives(values);
+
+                // Multi-Condition Signal Filtering
+                var sameSign = (fastWLS.slope * slowWLS.slope > 0);
+                var linearThreshold = 0.35;
+                var significant = Math.abs(fastWLS.t_stat) > 1.96;
+                var highConviction = sameSign && (fastWLS.R2 >= linearThreshold) && significant;
+
+                var slopeColor = '#64748b'; // Neutral Gray default
+                var statusText = 'NEUTRAL (R²=' + fastWLS.R2.toFixed(2) + ')';
+
+                if (highConviction) {
+                    if (fastWLS.slope > 0) {
+                        slopeColor = '#10b981'; // Bullish Signal
+                        statusText = 'BUY (t=' + fastWLS.t_stat.toFixed(1) + '|R²=' + fastWLS.R2.toFixed(2) + ')';
+                    } else {
+                        slopeColor = '#ef4444'; // Bearish Signal
+                        statusText = 'SELL (t=' + fastWLS.t_stat.toFixed(1) + '|R²=' + fastWLS.R2.toFixed(2) + ')';
+                    }
+                }
+
+                if (tagEl) {
+                    tagEl.innerText = statusText;
+                    tagEl.style.color = slopeColor;
+                    tagEl.style.border = '1px solid ' + slopeColor;
+                }
+
                 new Chart(canvas, {
                     type: 'line',
                     data: {
                         labels: labels,
                         datasets: [
                             {
-                                label: 'Zero Reference',
+                                label: 'Zero Axis',
                                 data: labels.map(function() { return 0; }),
-                                borderColor: 'rgba(255, 255, 255, 0.25)',
+                                borderColor: 'rgba(255, 255, 255, 0.2)',
                                 borderWidth: 1,
-                                borderDash: [4, 4],
+                                borderDash: [3, 3],
                                 pointRadius: 0,
                                 fill: false,
                                 tension: 0
                             },
                             {
-                                label: 'Slope Trend',
-                                data: slopeLine,
+                                label: 'Slow WLS Trend',
+                                data: slowWLS.fitted,
+                                borderColor: 'rgba(148, 163, 184, 0.35)',
+                                borderWidth: 1.5,
+                                borderDash: [2, 2],
+                                pointRadius: 0,
+                                fill: false,
+                                tension: 0
+                            },
+                            {
+                                label: 'Fast WLS Signal',
+                                data: fastWLS.fitted,
                                 borderColor: slopeColor,
                                 borderWidth: 2.5,
                                 pointRadius: 0,
