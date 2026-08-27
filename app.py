@@ -24,7 +24,7 @@ db = client["ig_sentiment_db"]
 baseline_collection = db["session_baselines"]
 daily_baseline_collection = db["daily_baselines"]
 cache_collection = db["api_cache"]
-chart_history_collection = db["session_chart_history"]
+chart_history_collection = db["session_chart_history"]  # NEW: powers the session trend chart
 
 # --- IG MARKET ID MAPPING ---
 IG_SYMBOL_MAP = {
@@ -36,7 +36,9 @@ IG_SYMBOL_MAP = {
     "USDCHF": "USDCHF",
     "USDCAD": "USDCAD",
     "USDJPY": "USDJPY",
-    # Crosses (21)
+    # Crosses (21) -- completes the full 8-currency matrix (8 choose 2 = 28
+    # pairs total) so every currency's index is built from all 7 pairs it
+    # appears in, the same way MyFXBook's 28-pair index works.
     "EURGBP": "EURGBP",
     "EURAUD": "EURAUD",
     "EURNZD": "EURNZD",
@@ -59,10 +61,14 @@ IG_SYMBOL_MAP = {
     "CADJPY": "CADJPY",
     "CHFJPY": "CHFJPY",
     # Gold
-    "XAUUSD": "GC"
+    "XAUUSD": "GC"  # IG uses 'GC' for Gold
 }
 
 IG_SESSION_TOKENS = {"cst": None, "x_security_token": None}
+# Tracks repeated auth failures so a bad credential (e.g. a typo after a
+# redeploy) can't retry every 60-second cycle indefinitely -- that pattern
+# is what most likely caused the earlier "multiple failed login attempts"
+# suspension.
 IG_AUTH_FAILURE_STATE = {"last_failure_at": None, "consecutive_failures": 0}
 
 def get_safe_volume(data_dict, primary_key, secondary_key, fallback_value):
@@ -80,6 +86,8 @@ def ensure_background_engine_running():
         background_engine_thread = threading.Thread(target=run_background_state_scheduler, daemon=True)
         background_engine_thread.start()
 
+from zoneinfo import ZoneInfo
+
 def get_ny_time():
     return datetime.datetime.now(ZoneInfo("America/New_York"))
 
@@ -87,7 +95,7 @@ def load_db_document(collection, doc_id="state_doc"):
     try:
         doc = collection.find_one({"_id": doc_id})
         return doc if doc else {}
-    except Exception:
+    except Exception as e:
         return {}
 
 def save_db_document(collection, data, doc_id="state_doc"):
@@ -145,6 +153,8 @@ def fetch_ig_client_sentiment():
         failures = IG_AUTH_FAILURE_STATE["consecutive_failures"]
         last_failure = IG_AUTH_FAILURE_STATE["last_failure_at"]
         if failures > 0 and last_failure:
+            # Backoff: 1 min, 2 min, 4 min... capped at 30 min between retries,
+            # instead of hammering /session every single 60-second cycle.
             cooldown_seconds = min(60 * (2 ** (failures - 1)), 1800)
             elapsed = (datetime.datetime.now(datetime.timezone.utc) - last_failure).total_seconds()
             if elapsed < cooldown_seconds:
@@ -195,6 +205,13 @@ def fetch_ig_client_sentiment():
         return None
 
 def record_chart_snapshot(symbols, current_session_label, current_date_str, ny_now):
+    """NEW, additive-only function for the session trend chart. Computes the
+    same 'combined value' (signed session delta + signed daily delta) that
+    process_sentiment_matrix already computes for the UP/DOWN panels, but
+    keeps its own independent copy of the math so nothing in the existing
+    dashboard logic is touched. Resets each currency's point history the
+    moment the session label changes, matching the same session boundaries
+    the rest of the app already uses."""
     try:
         stored_baseline = load_db_document(baseline_collection)
         baseline_volumes = stored_baseline.get("volumes", {})
@@ -240,7 +257,7 @@ def record_chart_snapshot(symbols, current_session_label, current_date_str, ny_n
             d_net_shift = round(daily_long_delta[cur] - daily_short_delta[cur], 2)
             combined_value = round(net_shift + d_net_shift, 2)
             points.setdefault(cur, []).append({"t": timestamp, "v": combined_value})
-            points[cur] = points[cur][-600:]
+            points[cur] = points[cur][-600:]  # cap history so the doc doesn't grow unbounded across a long session
 
         save_db_document(chart_history_collection, {
             "session": current_session_label,
@@ -257,7 +274,10 @@ def run_background_state_scheduler():
             current_date_str = ny_now.strftime("%Y-%m-%d")
             current_session_label, session_anchor_hour = get_current_session_details(ny_now)
 
-            weekday = ny_now.weekday()
+            # Weekend market-closed pause: Forex is shut from Friday 5pm NY
+            # through Sunday 5pm NY. Fetching every 60s through that whole
+            # stretch just re-pulls the same frozen numbers -- skip it.
+            weekday = ny_now.weekday()  # Monday=0 ... Sunday=6
             market_closed_weekend = (
                 weekday == 5 or
                 (weekday == 4 and ny_now.hour >= 17) or
@@ -300,7 +320,7 @@ def run_background_state_scheduler():
                 }, "daily_state_doc")
 
             if symbols:
-                record_chart_snapshot(symbols, current_session_label, current_date_str, ny_now)
+                record_chart_snapshot(symbols, current_session_label, current_date_str, ny_now)  # NEW
 
         except Exception as e:
             print(f"Scheduler Loop Error: {str(e)}")
@@ -368,6 +388,7 @@ def process_sentiment_matrix():
         display_name = "Gold" if cur == "GOLD" else cur
         bias_output.append({"currency": display_name, "long_pct": round(inv_long_ratio * 100, 1), "bias_label": "BULLISH" if inv_long_ratio >= 0.5 else "BEARISH"})
 
+        # Normal unmultiplied percentage delta calculation
         net_shift = sess_long_delta[cur] - sess_short_delta[cur]
         formatted_score = round(net_shift, 2)
         status_str = "UP" if formatted_score > 0 else ("DOWN" if formatted_score < 0 else ("UP" if inv_long_ratio >= 0.5 else "DOWN"))
@@ -419,10 +440,10 @@ DASHBOARD_HTML = """
         .data-row { display: flex; align-items: center; padding: 11px 10px; border-bottom: 1px solid #1f2937; gap: 12px; }
         .bar-container { width: 100px; background: #334155; height: 8px; border-radius: 4px; }
         .bar-fill { height: 100%; border-radius: 4px; }
+        /* NEW: session trend chart styles */
         .chart-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-top: 5px; }
-        .chart-box { background-color: #1f2937; border-radius: 8px; padding: 12px; position: relative; }
-        .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-        .chart-label { font-size: 13px; font-weight: 700; color: #e2e8f0; }
+        .chart-box { background-color: #1f2937; border-radius: 8px; padding: 12px; }
+        .chart-label { font-size: 13px; font-weight: 700; color: #e2e8f0; margin-bottom: 6px; }
         .chart-canvas-wrap { position: relative; height: 90px; }
     </style>
 </head>
@@ -467,14 +488,13 @@ DASHBOARD_HTML = """
             </div>
         </div>
 
+        <!-- NEW: Session Sentiment Trend chart -->
         <div class="panel" style="margin-top: 25px;">
-            <h2>Session Sentiment Slope Trends</h2>
+            <h2>Session Sentiment Trend (Daily + Session Combined, resets each new session)</h2>
             <div class="chart-grid">
                 {% for cur in ['EUR','GBP','USD','AUD','NZD','CAD','CHF','JPY','GOLD'] %}
                 <div class="chart-box">
-                    <div class="chart-header">
-                        <div class="chart-label">{{ 'Gold' if cur == 'GOLD' else cur }}</div>
-                    </div>
+                    <div class="chart-label">{{ 'Gold' if cur == 'GOLD' else cur }}</div>
                     <div class="chart-canvas-wrap"><canvas id="chart-{{ cur }}"></canvas></div>
                 </div>
                 {% endfor %}
@@ -484,124 +504,59 @@ DASHBOARD_HTML = """
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
     <script>
         (function() {
-            function computeWLS(values, lambda) {
+            function computeSlopeLine(values) {
+                // NEW: simple least-squares linear regression over the point
+                // index (x) and combined value (y), used only to draw a
+                // trend line -- doesn't affect any stored or displayed data.
                 var n = values.length;
-                if (n < 2) return { slope: 0, fitted: values.slice(), R2: 0, t_stat: 0 };
-
-                var W = 0, Sx = 0, Sy = 0, Sxx = 0, Sxy = 0, Syy = 0;
-                var weights = [];
-
+                if (n < 2) return values.slice();
+                var sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
                 for (var i = 0; i < n; i++) {
-                    var w = Math.exp(-lambda * (n - 1 - i));
-                    weights.push(w);
-                    var x = i;
-                    var y = values[i];
-                    W += w;
-                    Sx += w * x;
-                    Sy += w * y;
-                    Sxx += w * x * x;
-                    Sxy += w * x * y;
-                    Syy += w * y * y;
+                    sumX += i;
+                    sumY += values[i];
+                    sumXY += i * values[i];
+                    sumXX += i * i;
                 }
-
-                var denom = (W * Sxx - Sx * Sx);
-                var slope = denom !== 0 ? (W * Sxy - Sx * Sy) / denom : 0;
-                var intercept = (Sy - slope * Sx) / W;
-
+                var denom = (n * sumXX - sumX * sumX);
+                var slope = denom !== 0 ? (n * sumXY - sumX * sumY) / denom : 0;
+                var intercept = (sumY - slope * sumX) / n;
                 var fitted = [];
-                var SSres = 0;
-                var SStot = Syy - (Sy * Sy) / W;
-                var unweighted_SSres = 0;
-
-                for (var j = 0; j < n; j++) {
-                    var y_hat = slope * j + intercept;
-                    fitted.push(y_hat);
-                    SSres += weights[j] * Math.pow(values[j] - y_hat, 2);
-                    unweighted_SSres += Math.pow(values[j] - y_hat, 2);
-                }
-
-                var R2 = SStot > 0 ? Math.max(0, 1 - (SSres / SStot)) : 0;
-
-                var s2 = n > 2 ? unweighted_SSres / (n - 2) : 0;
-                var x_bar = (n - 1) / 2;
-                var Sxx_unweighted = 0;
-                for (var k = 0; k < n; k++) Sxx_unweighted += Math.pow(k - x_bar, 2);
-                
-                var SE_m = Sxx_unweighted > 0 ? Math.sqrt(s2 / Sxx_unweighted) : 0;
-                var t_stat = SE_m > 0 ? slope / SE_m : 0;
-
-                return { slope: slope, fitted: fitted, R2: R2, t_stat: t_stat };
+                for (var j = 0; j < n; j++) fitted.push(slope * j + intercept);
+                return fitted;
             }
 
             var chartHistory = {{ chart_history | tojson }};
             var currencies = ['EUR','GBP','USD','AUD','NZD','CAD','CHF','JPY','GOLD'];
-
             currencies.forEach(function(cur) {
                 var points = chartHistory[cur] || [];
                 var canvas = document.getElementById('chart-' + cur);
                 if (!canvas) return;
-
                 var values = points.map(function(p) { return p.v; });
                 var labels = points.map(function(p) { return p.t; });
-
-                var fastWLS = computeWLS(values, 0.08);
-                var slowWLS = computeWLS(values, 0.015);
-
-                var sameSign = (fastWLS.slope * slowWLS.slope > 0);
-                var linearThreshold = 0.35;
-                var significant = Math.abs(fastWLS.t_stat) > 1.96;
-                var highConviction = sameSign && (fastWLS.R2 >= linearThreshold) && significant;
-
-                var slopeColor = '#64748b'; // Fallback Neutral Gray
-
-                if (highConviction) {
-                    if (fastWLS.slope > 0) {
-                        slopeColor = '#10b981'; // Hard Green (Bullish High Conviction)
-                    } else {
-                        slopeColor = '#ef4444'; // Hard Red (Bearish High Conviction)
-                    }
-                } else {
-                    if (fastWLS.slope > 0) {
-                        slopeColor = '#6ee7b7'; // Very Light Green (Neutral Upward Slope)
-                    } else if (fastWLS.slope < 0) {
-                        slopeColor = '#fca5a5'; // Very Light Red (Neutral Downward Slope)
-                    }
-                }
-
+                var slopeLine = computeSlopeLine(values);
+                var isUpward = slopeLine.length >= 2 && slopeLine[slopeLine.length - 1] > slopeLine[0];
+                var slopeColor = isUpward ? '#10b981' : '#ef4444';
                 new Chart(canvas, {
                     type: 'line',
                     data: {
                         labels: labels,
                         datasets: [
                             {
-                                label: 'Zero Axis',
+                                // zero reference line
                                 data: labels.map(function() { return 0; }),
-                                borderColor: 'rgba(255, 255, 255, 0.2)',
+                                borderColor: 'rgba(255, 255, 255, 0.5)',
                                 borderWidth: 1,
-                                borderDash: [3, 3],
+                                borderDash: [4, 4],
                                 pointRadius: 0,
-                                pointHoverRadius: 0,
                                 fill: false,
                                 tension: 0
                             },
                             {
-                                label: 'Slow Trend',
-                                data: slowWLS.fitted,
-                                borderColor: 'rgba(148, 163, 184, 0.35)',
-                                borderWidth: 1.5,
-                                borderDash: [2, 2],
-                                pointRadius: 0,
-                                pointHoverRadius: 0,
-                                fill: false,
-                                tension: 0
-                            },
-                            {
-                                label: 'Slope Signal',
-                                data: fastWLS.fitted,
+                                // slope/trend line, solid green (up) or red (down)
+                                data: slopeLine,
                                 borderColor: slopeColor,
-                                borderWidth: 2.5,
+                                borderWidth: 2,
                                 pointRadius: 0,
-                                pointHoverRadius: 0,
                                 fill: false,
                                 tension: 0
                             }
@@ -610,10 +565,7 @@ DASHBOARD_HTML = """
                     options: {
                         responsive: true,
                         maintainAspectRatio: false,
-                        plugins: {
-                            legend: { display: false },
-                            tooltip: { enabled: false }
-                        },
+                        plugins: { legend: { display: false } },
                         scales: {
                             x: { display: false },
                             y: { grid: { color: '#1f2937' }, ticks: { color: '#64748b', font: { size: 9 } } }
@@ -631,7 +583,7 @@ DASHBOARD_HTML = """
 @app.route('/')
 def index():
     try: 
-        chart_data = load_db_document(chart_history_collection, "chart_state_doc").get("points", {})
+        chart_data = load_db_document(chart_history_collection, "chart_state_doc").get("points", {})  # NEW
         return render_template_string(DASHBOARD_HTML, data=process_sentiment_matrix(), chart_history=chart_data)
     except Exception as e: 
         return jsonify({"error": str(e)}), 500
