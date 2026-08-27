@@ -4,7 +4,6 @@ import time
 import threading
 import re
 from flask import Flask, jsonify, render_template_string
-import cloudscraper
 import yfinance as yf
 from pymongo import MongoClient
 from zoneinfo import ZoneInfo
